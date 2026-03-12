@@ -1,0 +1,15 @@
+{
+  "MODEL_NAME": "google/gemma-2-2b",
+  "SAE_RELEASE": "gemma-scope-2b-pt-res-canonical",
+  "SAE_WIDTH": "width_16k",
+  "LAYER": 16,
+  "SAE_ID": "layer_16/width_16k/canonical",
+  "MAX_LENGTH": 768,
+  "USE_BOS_IN_SUM": true,
+  "TEXT_COL": "text",
+  "LABEL_COL": "label",
+  "LANG_COL": "lang",
+  "DOMAIN_COL": "data_type",
+  "RU_VALUE": "ru",
+  "SEED": 42
+}
