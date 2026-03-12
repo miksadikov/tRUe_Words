@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Расширенный анализ</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        .analysis-page {
+            padding: 24px 0 40px;
+        }
+
+        .analysis-block {
+            background: rgba(255,255,255,.68);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 20px;
+            margin-bottom: 28px;
+            box-shadow: 0 12px 25px rgba(16,24,40,.06);
+        }
+
+        .analysis-block h2,
+        .analysis-block h3 {
+            margin-top: 0;
+        }
+
+        .analysis-image {
+            width: 100%;
+            max-width: 1200px;
+            display: block;
+            margin: 18px 0 10px;
+            border-radius: 16px;
+        }
+
+        .analysis-list li {
+            margin-bottom: 10px;
+            line-height: 1.45;
+        }
+
+        .analysis-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+            margin: 20px 0;
+        }
+
+        .analysis-card {
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 16px;
+        }
+
+        .analysis-card__title {
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+
+        .analysis-card__share {
+            font-weight: 700;
+            color: var(--primary);
+            margin-bottom: 8px;
+        }
+
+        .back-link {
+            margin-top: 24px;
+        }
+
+        .back-link a {
+            font-weight: 700;
+        }
+
+        .error-box {
+            background: #fff4f4;
+            border: 1px solid #f2b8b8;
+            color: #8b1e1e;
+            border-radius: 16px;
+            padding: 14px 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container analysis-page">
+        <h1>Расширенный анализ</h1>
+
+        {% if error %}
+            <div class="error-box">{{ error }}</div>
+        {% endif %}
+
+        {% if dep %}
+        <div class="analysis-block">
+            <h2>Расширенный анализ по методу DependencyAI</h2>
+
+            <p><strong>{{ dep.verdict_text }}</strong> (Уверенность: {{ dep.confidence_pct | round(2) }}%)</p>
+            <p>{{ dep.description_text | safe }}</p>
+
+            <img src="{{ dep.img_path }}" alt="График DependencyAI" class="analysis-image">
+
+            <h3>Какие стилистические отпечатки сильнее всего повлияли на вывод</h3>
+            <ul class="analysis-list">
+                {% for item in dep.top_results_list %}
+                    <li><strong>{{ item['readable_style'] }}</strong> — {{ item['share_pct'] | round(1) }}% вклада в решение модели.</li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        {% if diveye %}
+        <div class="analysis-block">
+            <h2>Расширенный анализ по методу DivEye</h2>
+
+            <p><strong>{{ diveye.verdict_text }}</strong> (Уверенность: {{ diveye.confidence_pct | round(2) }}%)</p>
+            <p>{{ diveye.description_text | safe }}</p>
+
+            <img src="{{ diveye.img_path }}" alt="График DivEye" class="analysis-image">
+
+            <h3>Какие аспекты текста DivEye анализирует сильнее всего</h3>
+            <div class="analysis-cards">
+                {% for card in diveye.group_cards %}
+                <div class="analysis-card">
+                    <div class="analysis-card__title">{{ card.title }}</div>
+                    <div class="analysis-card__share">{{ card.share_pct | round(1) }}% вклада</div>
+                    <div>{{ card.explanation }}</div>
+                </div>
+                {% endfor %}
+            </div>
+
+            <h3>Какие особенности сильнее всего повлияли на решение DivEye</h3>
+            <ul class="analysis-list">
+                {% for item in diveye.top_signals %}
+                    <li>
+                        <strong>{{ item.name }}</strong> — {{ item.share_pct | round(1) }}% вклада.
+                        Это признак, который {{ item.explanation }}
+                    </li>
+                {% endfor %}
+            </ul>
+
+            <p>{{ diveye.summary_text }}</p>
+        </div>
+        {% endif %}
+
+        <div class="back-link">
+            <a href="/">Вернуться на главную страницу</a>
+        </div>
+    </div>
+</body>
+</html>

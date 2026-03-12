@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Детектор русскоязычных ИИ‑текстов</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div id="loadingOverlay" class="loading-overlay" style="display:none;">
+    <div class="loading-box">
+      <div class="spinner"></div>
+      <div class="loading-title">Идёт анализ текста</div>
+      <div class="loading-subtitle">Это может занять некоторое время. Пожалуйста, подождите…</div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="container topbar__inner">
+      <div class="brand">
+        <div class="brand__mark" aria-hidden="true"></div>
+        <div class="brand__name">t<span style="color: blue;">ru</span>eWords</div>
+      </div>
+
+      <nav class="nav">
+        <a class="nav__link" href="#features">О сервисе</a>
+        <a class="nav__link" href="#how">Как это работает</a>
+        <a class="nav__link" href="#about">Для разработчиков</a>
+      </nav>
+
+      
+    </div>
+  </header>
+
+  <main class="hero" id="scan">
+    <div class="container hero__grid">
+      <section class="hero__left">
+        <h1 class="hero__title">
+          Детектор русскоязычных<br>
+          ИИ‑текстов, <span class="grad">использующий несколько моделей детекции</span>
+        </h1>
+
+        <p class="hero__subtitle">
+          Проверка русскоязычных текстов с помощью ансамбля современных моделей, сочетающего
+          лингвистические признаки, вероятностный анализ и нейросетевые методы.
+        </p>
+
+        <div class="hero__actions">
+          
+          <a class="btn btn--ghost" href="#how">Подробнее</a>
+        </div>
+
+        <div class="hero__badges">
+          <div class="badge">✓ Без регистрации</div>
+          <div class="badge">✓ Русский язык</div>
+          <div class="badge">✓ Возможен локальный запуск</div>
+        </div>
+      </section>
+
+      <aside class="card">
+        <h2 class="card__title">Проверь, кто написал текст - человек или ИИ</h2>
+
+        {% if error %}
+          <div class="alert alert--error">{{ error }}</div>
+        {% endif %}
+
+        {% if result %}
+          <div class="result">
+            <div class="result__row">
+              <div class="result__label">Вероятность ИИ (DependencyAI)</div>
+              <div class="result__value">{{ (result.probability_dependencyAI * 100) | round(2) }}%</div>
+            </div>
+
+            <div class="result__row">
+              <div class="result__label">Вероятность ИИ (DivEye)</div>
+              <div class="result__value">{{ (result.probability_divEye * 100) | round(2) }}%</div>
+            </div>
+
+            <div class="result__row">
+              <div class="result__label">Вероятность ИИ (SAE/Gemma)</div>
+              <div class="result__value">
+                {% if result.sae_xgb_available %}
+                  {{ (result.probability_sae_xgb * 100) | round(2) }}%
+                {% else %}
+                  Недоступно
+                {% endif %}
+              </div>
+            </div>
+
+            <div class="result__row">
+              <div class="result__label">Итоговая вероятность ИИ</div>
+              <div class="result__value">{{ (result.average_probability * 100) | round(2) }}%</div>
+            </div>
+
+          <div class="result__actions result__actions--corner">
+            <div class="pill {{ 'pill--ai' if result.final_prediction == 'ИИ' else 'pill--human' }}">
+              Итог: {{ result.final_prediction }} (Уверенность: {{ result.final_confidence | round(2) }}%)
+            </div>
+
+            <form action="/extended_analysis_page" method="post" class="result__analysis-form">
+              <input type="hidden" name="diveye_ai_prob" value="{{ result.probability_divEye }}">
+              <button type="submit" class="btn btn--primary result__analysis-btn">Расширенный анализ</button>
+            </form>
+          </div>
+
+            <div class="result__row result__row--muted">
+              <div>Вес DivEye</div>
+              <div>{{ (result.diveye_weight * 100) | round(0) }}%</div>
+            </div>
+
+            <div class="result__row result__row--muted">
+              <div>Вес DependencyAI</div>
+              <div>{{ (result.dependency_weight * 100) | round(0) }}%</div>
+            </div>
+
+            <div class="result__row result__row--muted">
+              <div>Вес SAE/Gemma детектора</div>
+              <div>{{ (result.sae_xgb_weight * 100) | round(0) }}%</div>
+            </div>
+
+            <div class="result__row result__row--muted">
+              <div>Вес ансамбля DependencyAI + DivEye</div>
+              <div>{{ (result.legacy_ensemble_weight * 100) | round(0) }}%</div>
+            </div>
+
+            {% if result.ensemble_rationale %}
+            <div class="result__row result__row--muted" style="display:block;">
+              <div style="margin-bottom:8px;"><strong>Почему итоговый вес выбран именно так</strong></div>
+              <ul style="margin:0; padding-left:18px;">
+                {% for reason in result.ensemble_rationale[:3] %}
+                  <li>{{ reason }}</li>
+                {% endfor %}
+              </ul>
+            </div>
+            {% endif %}
+        {% endif %}
+
+        <form class="form" method="post" action="/predict" enctype="multipart/form-data" id="analyzeForm">
+          <label class="form__label" for="text">Текст</label>
+          <textarea id="text" name="text" class="textarea" placeholder="Вставьте текст сюда или загрузите из файла..." maxlength="5000">{{ text_value }}</textarea>
+          <div class="form__hint"><span id="counter">0</span> / 5,000 символов</div>
+
+          <div class="form__row">
+            <button type="submit" name="action" value="predict" class="btn btn--primary btn--wide" id="predictBtn">
+              Проанализировать текст
+            </button>
+
+            <label class="btn btn--outline btn--wide filebtn">
+              Загрузить файл
+              <input type="file" name="file" accept=".txt,text/plain" onchange="loadFile(event)" />
+            </label>
+          </div>
+
+          <div class="tos">
+            Нажимая «Проанализировать текст», вы соглашаетесь с условиями использования этого демо‑приложения.
+          </div>
+        </form>
+      </aside>
+    </div>
+  </main>
+
+  <section class="section" id="features">
+    <div class="container">
+      <h3 class="section__title">О сервисе</h3>
+      <div class="features">
+        <div class="feature">
+          <div class="feature__title">Лингвистический анализ</div>
+          <div class="feature__text">Анализ ведется на уровне синтаксических и структурных признаков, что помогает выявлять характерные шаблоны, часто встречающиеся в машинно сгенерированных текстах.</div>
+        </div>
+        <div class="feature">
+          <div class="feature__title">Ансамбль моделей</div>
+          <div class="feature__text">Для повышения точности используются несколько детекторов, каждый из которых оценивает текст со своей стороны: через структуру, распределение вероятностей и скрытые представления нейросетевой модели.</div>
+        </div>
+        <div class="feature">
+          <div class="feature__title">API-доступ для интеграций</div>
+          <div class="feature__text">Проверка текстов может быть встроена в сторонние приложения и backend-сценарии с помощью API.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="how">
+    <div class="container">
+      <h3 class="section__title">Как это работает</h3>
+      <ol class="steps">
+        <li>Текст проходит через несколько независимых детекторов. Каждый из них анализирует разные свойства текста: синтаксис, статистику токенов и признаки, извлечённые из нейросетевой модели.</li>
+        <li>Каждая модель вычисляет собственную вероятность. Это позволяет не опираться на один источник сигнала, а сравнивать выводы разных подходов.</li>
+        <li>Результаты объединяются в итоговую оценку. Финальный вывод строится на ансамбле моделей и отражает совокупную уверенность системы в том, что текст написан человеком или сгенерирован ИИ.</li>
+      </ol>
+    </div>
+  </section>
+
+  <footer class="footer" id="about">
+    <div class="container footer__inner">
+      <div class="footer__left">
+        <div class="brand brand--small">
+          <div class="brand__mark" aria-hidden="true"></div>
+          <div class="brand__name">t<span style="color: blue;">ru</span>eWords</div>
+        </div>
+        <div class="footer__note">Демо‑веб‑интерфейс для запуска моделей детектирования ИИ‑текстов на русском языке.</div>
+      </div>
+      <div class="footer__right">
+        <a class="footer__link" href="#scan">Сканирование</a>
+        <a class="footer__link" href="#features">О сервисе</a>
+        <a class="footer__link" href="#how">Как это работает</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+
+<script>
+  function loadFile(event) {
+    const reader = new FileReader();
+    reader.onload = function(){
+      document.getElementById('text').value = reader.result;
+    };
+    reader.readAsText(event.target.files[0]);
+  }
+</script>
+</body>
+</html>
