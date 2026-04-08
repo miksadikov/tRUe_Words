@@ -11,6 +11,7 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 import joblib
+import pickle
 import spacy
 import numpy as np
 import re
@@ -60,10 +61,10 @@ class DependencyAIDetector:
         return self.model.predict_proba(transformed_text)[0, 1]
 
 class RussianAIDetector:
-    def __init__(self, model_path="./local_model", xgb_path="diveye_llmtrace_ru_xgb.pkl"):
+    def __init__(self, model_path="./local_model", xgb_path="diveye_llmtrace_ru_booster.pkl"):
         self.device = "cpu"
+        self.max_length = 1024
 
-        # Загружаем токенизатор и модель из локальной папки
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -74,35 +75,149 @@ class RussianAIDetector:
         ).to(self.device)
         self.model.eval()
 
-        # Загружаем классификатор
-        self.clf = joblib.load(xgb_path)
-        self.feature_dim = 9
+        if xgb_path.endswith(".joblib"):
+            artifact = joblib.load(xgb_path)
+        else:
+            with open(xgb_path, "rb") as f:
+                artifact = pickle.load(f)
+
+        if hasattr(artifact, "predict_proba"):
+            self.clf = artifact
+            self.calibrator = None
+            self.threshold = 0.5
+            self.feature_columns = None
+            self.use_booster = False
+
+        elif isinstance(artifact, dict):
+            self.clf = artifact["model"]
+            self.calibrator = artifact.get("calibrator")
+            self.threshold = float(artifact.get("threshold", 0.5))
+            self.feature_columns = artifact.get("feature_columns")
+            self.use_booster = bool(artifact.get("use_booster", False))
+        else:
+            raise ValueError("Неизвестный формат файла детектора")
+
+        self.feature_dim = len(self.feature_columns) if self.feature_columns else 9
         print("Модель и токенизатор загружены из локальной папки:", model_path)
+        print("DivEye threshold =", self.threshold)
+        print("DivEye feature_dim =", self.feature_dim)
 
     @torch.no_grad()
-    def _compute_surprisal(self, text, max_length=512):
-        enc = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length).to(self.device)
+    def _compute_surprisal(self, text, max_length=None):
+        max_length = max_length or self.max_length
+        enc = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length
+        ).to(self.device)
+
         input_ids = enc["input_ids"]
         attention_mask = enc["attention_mask"]
 
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits  # [1, T, V]
+        logits = outputs.logits
 
-        # Shift so that we predict token t using history < t
         shift_logits = logits[:, :-1, :]
         shift_labels = input_ids[:, 1:]
 
         log_probs = torch.log_softmax(shift_logits, dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+        token_log_probs = log_probs.gather(
+            dim=-1,
+            index=shift_labels.unsqueeze(-1)
+        ).squeeze(-1)
 
-        # Surprisal = -log P
         surprisal = -token_log_probs.detach().cpu().numpy()[0]
         return surprisal.astype(np.float32)
 
-    def _extract_features(self, surprisal):
+    def _safe_quantile(self, arr, q):
+        if arr.size == 0:
+            return 0.0
+        return float(np.quantile(arr, q))
+
+    def _safe_mean(self, arr):
+        return float(np.mean(arr)) if arr.size else 0.0
+
+    def _safe_std(self, arr):
+        return float(np.std(arr)) if arr.size else 0.0
+
+    def _safe_var(self, arr):
+        return float(np.var(arr)) if arr.size else 0.0
+
+    def _safe_max(self, arr):
+        return float(np.max(arr)) if arr.size else 0.0
+
+    def _text_stabilizer_features(self, text, surprisal):
+        token_count = int(len(surprisal))
+
+        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+        sent_lengths = [len(s.split()) for s in sentences if s.strip()]
+
+        mean_sent_len = float(np.mean(sent_lengths)) if sent_lengths else 0.0
+        std_sent_len = float(np.std(sent_lengths)) if sent_lengths else 0.0
+
+        punct_ratio = 0.0
+        if len(text) > 0:
+            punct_ratio = len(re.findall(r"[,:;.!?\-()\"]", text)) / max(len(text), 1)
+
+        words = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+        if words:
+            ttr = len(set(words)) / len(words)
+        else:
+            ttr = 0.0
+
+        return {
+            "token_count": float(token_count),
+            "mean_sent_len": float(mean_sent_len),
+            "std_sent_len": float(std_sent_len),
+            "punct_ratio": float(punct_ratio),
+            "ttr": float(ttr),
+        }
+
+    def _extract_features_dict(self, text, surprisal):
         S = np.asarray(surprisal, dtype=np.float32)
         if S.size == 0:
-            return np.zeros(self.feature_dim, dtype=np.float32)
+            base = {
+                "s_mean": 0.0, "s_std": 0.0, "s_q90": 0.0,
+                "d1_mean_abs": 0.0, "d1_std": 0.0, "d1_q90_abs": 0.0,
+                "d2_mean_abs": 0.0, "d2_std": 0.0, "d2_q90_abs": 0.0,
+            }
+            base.update(self._text_stabilizer_features(text, S))
+            return base
+
+        d1 = np.diff(S)
+        d2 = np.diff(d1)
+
+        feats = {
+            "s_mean": self._safe_mean(S),
+            "s_std": self._safe_std(S),
+            "s_q90": self._safe_quantile(S, 0.90),
+
+            "d1_mean_abs": self._safe_mean(np.abs(d1)),
+            "d1_std": self._safe_std(d1),
+            "d1_q90_abs": self._safe_quantile(np.abs(d1), 0.90),
+
+            "d2_mean_abs": self._safe_mean(np.abs(d2)),
+            "d2_std": self._safe_std(d2),
+            "d2_q90_abs": self._safe_quantile(np.abs(d2), 0.90),
+        }
+
+        feats.update(self._text_stabilizer_features(text, S))
+        return feats
+
+    def _extract_features(self, surprisal, text=None):
+        text = text or ""
+        feats_dict = self._extract_features_dict(text, surprisal)
+
+        if self.feature_columns:
+            return np.array(
+                [float(feats_dict.get(col, 0.0)) for col in self.feature_columns],
+                dtype=np.float32
+            )
+
+        S = np.asarray(surprisal, dtype=np.float32)
+        if S.size == 0:
+            return np.zeros(9, dtype=np.float32)
 
         dS = np.diff(S)
         d2S = np.diff(dS)
@@ -112,27 +227,42 @@ class RussianAIDetector:
                 return [0.0, 0.0, 0.0]
             return [float(np.mean(arr)), float(np.var(arr)), float(np.max(arr))]
 
-        # 1-3: stats(S), 4-6: stats(dS), 7-9: stats(d2S)
         feats = safe_stats(S) + safe_stats(dS) + safe_stats(d2S)
         return np.array(feats, dtype=np.float32)
+
+    def _predict_raw_proba(self, X):
+        proba = float(self.clf.predict_proba(X)[0, 1])
+
+        if self.calibrator is not None:
+            try:
+                proba = float(self.calibrator.predict(np.array([proba]))[0])
+            except Exception:
+                pass
+
+        return proba
 
     def predict_proba(self, text):
         try:
             if not text or len(text.strip()) == 0:
-                return 0.5, "Не определено", 0.5  # Если текста нет, возвращаем дефолтные значения
-            
+                return 0.5, "Не определено", 0.5
+
             surprisal_seq = self._compute_surprisal(text)
-            features = self._extract_features(surprisal_seq)
-            proba_ai = self.clf.predict_proba(features.reshape(1, -1))[0, 1]
-            
-            # Определяем метку и уверенность
-            label = "ИИ-ГЕНЕРИРОВАННЫЙ" if proba_ai > 0.5 else "Человеческий"
-            confidence = proba_ai if proba_ai > 0.5 else (1 - proba_ai)
-            
+            features = self._extract_features(surprisal_seq, text=text)
+            proba_ai = self._predict_raw_proba(features.reshape(1, -1))
+
+            label = "ИИ-ГЕНЕРИРОВАННЫЙ" if proba_ai >= self.threshold else "Человеческий"
+
+            if proba_ai >= self.threshold:
+                confidence = proba_ai
+            else:
+                confidence = 1.0 - proba_ai
+
             return proba_ai, label, confidence
+
         except Exception as e:
             print(f"Ошибка при детекции ИИ: {e}")
             return 0.5, "Не определено", 0.5
+
 
 class SAEGemmaXGBDetector:
     def __init__(self, config_path="run_config.json", xgb_path="xgb_layer_16.joblib", model_path="gemma-2-2b", hf_token=None):
@@ -602,102 +732,127 @@ def extended_analysis_diveye(text, detector, diveye_ai_prob):
             "summary_text": ""
         }
 
-    # 1. Получаем surprisal и признаки текущей реализации DivEye
     surprisal_seq = detector._compute_surprisal(text)
-    features = detector._extract_features(surprisal_seq)
+    features = detector._extract_features(surprisal_seq, text=text)
 
     score = float(diveye_ai_prob)
-    is_ai = score > 0.5
+    is_ai = score >= getattr(detector, "threshold", 0.5)
     confidence_pct = (score if is_ai else (1.0 - score)) * 100.0
     verdict_text = "Текст сгенерирован с помощью ИИ" if is_ai else "Текст написан человеком"
 
     description_text = """
     Метод DivEye анализирует не сами слова, а то, как по ходу текста меняется неожиданность токенов для языковой модели.
-    Если текст слишком ровный и предсказуемый, это чаще похоже на ИИ.
-    Если в тексте есть естественные скачки и более живая динамика неожиданности, это чаще похоже на человека.
+    В этой версии также учитываются дополнительные стабилизирующие признаки текста и применяется калибровка вероятности.
     Подробнее про метод можно почитать здесь:
     <a href="https://arxiv.org/pdf/2509.18880" target="_blank" rel="noopener">ссылка на статью</a>.
     """
 
-    # 2. Псевдо-локальные вклады признаков для текущей реализации:
-    #    значение признака * importance классификатора
-    importances = np.asarray(detector.clf.feature_importances_, dtype=np.float32)
+    if hasattr(detector.clf, "feature_importances_"):
+        importances = np.asarray(detector.clf.feature_importances_, dtype=np.float32)
+    else:
+        importances = np.ones(len(features), dtype=np.float32)
+
     local_scores = np.abs(features) * importances
+    total_local = float(local_scores.sum()) if local_scores.size else 0.0
 
-    feature_names = [
-        "Средняя неожиданность текста",
-        "Разброс неожиданности текста",
-        "Пиковая неожиданность текста",
-        "Среднее изменение ритма",
-        "Разброс локальных изменений",
-        "Максимальный локальный скачок",
-        "Средняя глубинная неровность",
-        "Разброс глубинной неровности",
-        "Максимальный всплеск глубинной неровности",
-    ]
+    if detector.feature_columns:
+        feature_names = detector.feature_columns
+    else:
+        feature_names = [
+            "s_mean", "s_var", "s_max",
+            "d1_mean", "d1_var", "d1_max",
+            "d2_mean", "d2_var", "d2_max",
+        ]
 
-    feature_explanations = {
-        "Средняя неожиданность текста": "показывает, насколько текст в целом предсказуем для языковой модели.",
-        "Разброс неожиданности текста": "показывает, насколько текст ровный или, наоборот, неоднородный по уровню неожиданности.",
-        "Пиковая неожиданность текста": "отражает наличие отдельных нетривиальных и неожиданных фрагментов.",
-        "Среднее изменение ритма": "характеризует, насколько плавно или резко surprisal меняется от токена к токену.",
-        "Разброс локальных изменений": "показывает, насколько часто ритм текста меняется неравномерно.",
-        "Максимальный локальный скачок": "отражает самые сильные локальные переломы ритма текста.",
-        "Средняя глубинная неровность": "характеризует общий уровень изменчивости самого ритма изменений.",
-        "Разброс глубинной неровности": "показывает, насколько живая и неоднородная глубинная динамика текста.",
-        "Максимальный всплеск глубинной неровности": "фиксирует самые сильные вторичные колебания ритма текста."
+    readable_map = {
+        "s_mean": "Средняя неожиданность текста",
+        "s_std": "Разброс неожиданности текста",
+        "s_q90": "Высокие пики неожиданности",
+        "d1_mean_abs": "Средняя сила локальных изменений",
+        "d1_std": "Разброс локальных изменений",
+        "d1_q90_abs": "Сильные локальные скачки",
+        "d2_mean_abs": "Средняя глубинная неровность",
+        "d2_std": "Разброс глубинной неровности",
+        "d2_q90_abs": "Сильные вторичные колебания",
+        "token_count": "Длина текста в токенах",
+        "mean_sent_len": "Средняя длина предложений",
+        "std_sent_len": "Разброс длины предложений",
+        "punct_ratio": "Доля пунктуации",
+        "ttr": "Лексическое разнообразие",
+        "base_score": "Оценка базового детектора",
     }
 
-    total_local = float(local_scores.sum()) if local_scores.size else 0.0
+    explanation_map = {
+        "s_mean": "Показывает, насколько текст в целом предсказуем для языковой модели.",
+        "s_std": "Показывает, насколько текст ровный или неоднородный по уровню неожиданности.",
+        "s_q90": "Отражает выраженные неожиданные участки текста.",
+        "d1_mean_abs": "Характеризует среднюю силу локальных изменений ритма.",
+        "d1_std": "Показывает, насколько неравномерно меняется ритм текста.",
+        "d1_q90_abs": "Выделяет сильные локальные переломы ритма.",
+        "d2_mean_abs": "Характеризует среднюю глубинную изменчивость ритма.",
+        "d2_std": "Показывает, насколько неоднородна глубинная динамика текста.",
+        "d2_q90_abs": "Фиксирует самые сильные вторичные колебания ритма.",
+        "token_count": "Длинные и короткие тексты ведут себя по-разному; длина помогает стабилизировать решение.",
+        "mean_sent_len": "Средняя длина предложений помогает учитывать общий стиль текста.",
+        "std_sent_len": "Разброс длины предложений показывает естественность структуры.",
+        "punct_ratio": "Доля пунктуации помогает учитывать форму изложения.",
+        "ttr": "Лексическое разнообразие помогает учитывать богатство словаря.",
+        "base_score": "Сигнал вашего базового детектора, усиленный DivEye.",
+    }
 
     feature_items = []
     for name, raw in zip(feature_names, local_scores):
         share_pct = (float(raw) / total_local * 100.0) if total_local > 0 else 0.0
         feature_items.append({
-            "name": name,
+            "name": readable_map.get(name, name),
             "share_pct": share_pct,
-            "explanation": feature_explanations[name]
+            "explanation": explanation_map.get(name, "Дополнительный признак, влияющий на итоговое решение.")
         })
 
     feature_items = sorted(feature_items, key=lambda x: x["share_pct"], reverse=True)
     top_signals = feature_items[:5]
 
-    # 3. Группы признаков
-    group_defs = [
-        ("Общая предсказуемость текста", [0, 1, 2],
-         "Этот блок описывает, насколько текст в целом предсказуем для языковой модели: насколько он ровный, однородный и содержит ли неожиданные фрагменты."),
-        ("Локальные изменения ритма", [3, 4, 5],
-         "Этот блок показывает, насколько резко surprisal меняется от токена к токену и есть ли в тексте естественные локальные перепады."),
-        ("Глубинная неровность текста", [6, 7, 8],
-         "Этот блок описывает более глубокую динамику текста: насколько неоднородно меняется сам ритм изменений, а не только отдельные токены.")
+    # Группировка
+    group_scores = {
+        "Ритм surprisal": 0.0,
+        "Стабилизаторы текста": 0.0,
+        "Базовый детектор": 0.0,
+    }
+
+    for name, raw in zip(feature_names, local_scores):
+        if name.startswith("s_") or name.startswith("d1_") or name.startswith("d2_"):
+            group_scores["Ритм surprisal"] += float(raw)
+        elif name == "base_score":
+            group_scores["Базовый детектор"] += float(raw)
+        else:
+            group_scores["Стабилизаторы текста"] += float(raw)
+
+    total_groups = sum(group_scores.values()) or 1.0
+    group_cards = [
+        {
+            "title": k,
+            "share_pct": v / total_groups * 100.0,
+            "explanation": {
+                "Ритм surprisal": "Блок признаков, связанных с динамикой неожиданности текста.",
+                "Стабилизаторы текста": "Дополнительные текстовые признаки, которые делают решение устойчивее.",
+                "Базовый детектор": "Сигнал исходного детектора, усиленный DivEye.",
+            }[k]
+        }
+        for k, v in group_scores.items()
+        if v > 0
     ]
 
-    group_cards = []
-    total_groups = float(local_scores.sum()) if local_scores.size else 0.0
-    for title, idxs, expl in group_defs:
-        raw_group = float(np.sum(local_scores[idxs]))
-        share_pct = (raw_group / total_groups * 100.0) if total_groups > 0 else 0.0
-        group_cards.append({
-            "title": title,
-            "share_pct": share_pct,
-            "explanation": expl
-        })
-
-    # 4. Текстовая итоговая интерпретация
     if is_ai:
         summary_text = (
-            "Метод DivEye показал, что текст выглядит слишком ровным и предсказуемым по динамике неожиданности. "
-            "Изменения surprisal по ходу текста оказались более сглаженными, а структура ритма — менее живой и вариативной. "
-            "Поэтому DivEye относит этот текст к сгенерированным с помощью ИИ."
+            "Улучшенный DivEye показал, что текст ближе к ИИ: вклад внесли и ритм surprisal, "
+            "и дополнительные стабилизирующие признаки."
         )
     else:
         summary_text = (
-            "Метод DivEye показал, что текст обладает более естественной и живой динамикой неожиданности. "
-            "Ритм текста меняется не слишком ровно, а наиболее заметный вклад внесли признаки, связанные "
-            "с неоднородностью и локальными перепадами surprisal. Поэтому DivEye относит этот текст к написанным человеком."
+            "Улучшенный DivEye показал, что текст ближе к человеческому: ритм surprisal и "
+            "дополнительные признаки не дают сильного сигнала в пользу ИИ."
         )
 
-    # 5. График surprisal по токенам
     s = np.asarray(surprisal_seq, dtype=np.float32)
     x = np.arange(1, len(s) + 1)
 
@@ -710,7 +865,6 @@ def extended_analysis_diveye(text, detector, diveye_ai_prob):
     plt.figure(figsize=(20, 9))
     plt.plot(x, s, linewidth=1.8, alpha=0.35, label="Surprisal по токенам")
     plt.plot(x, smooth, linewidth=3.5, label="Сглаженная кривая surprisal")
-
     plt.title("Ритм неожиданности текста по методу DivEye", fontsize=26, loc="left")
     plt.xlabel("Позиция токена в тексте", fontsize=20)
     plt.ylabel("Неожиданность токена (surprisal)", fontsize=20)
@@ -733,6 +887,180 @@ def extended_analysis_diveye(text, detector, diveye_ai_prob):
         "top_signals": top_signals,
         "summary_text": summary_text
     }
+
+
+def extended_analysis_sae_gemma(text, detector):
+    try:
+        if detector is None or not getattr(detector, "available", False):
+            return {"error": "SAE/Gemma/XGB детектор недоступен."}
+
+        if not text or not text.strip():
+            return {"error": "Пустой текст."}
+
+        import os
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import xgboost as xgb
+        import torch
+
+        # 1. Токенизация и проход через Gemma
+        batch = detector._tokenize([text])
+
+        with torch.no_grad():
+            outputs = detector.model(**batch, output_hidden_states=True)
+            hidden_states = outputs.hidden_states
+            resid = hidden_states[detector.layer + 1]   # [1, T, D]
+
+            sae_latents = detector.sae.encode(resid)    # [1, T, F]
+
+            attn = batch["attention_mask"].unsqueeze(-1).to(sae_latents.dtype)
+            sae_latents = sae_latents * attn
+
+            if not detector.use_bos_in_sum and sae_latents.shape[1] > 0:
+                sae_latents[:, 0, :] = 0
+
+            pooled = sae_latents.sum(dim=1)             # [1, F]
+            X = pooled.detach().float().cpu().numpy()
+
+        # 2. Предсказание и покомпонентные вклады XGBoost
+        booster = detector.clf.get_booster()
+        dmatrix = xgb.DMatrix(X)
+
+        contribs = booster.predict(dmatrix, pred_contribs=True)  # [1, F+1]
+        contribs = contribs[0]
+
+        # последний элемент — bias
+        feature_contribs = contribs[:-1]
+        bias_term = float(contribs[-1])
+
+        prob_ai = float(detector.clf.predict_proba(X)[0, 1])
+        prediction = "ИИ-ГЕНЕРИРОВАННЫЙ" if prob_ai >= 0.5 else "Человеческий"
+
+        # 3. Сырые pooled-активации по признакам
+        pooled_vec = X[0]
+
+        # 4. Топ-признаки по абсолютному вкладу
+        top_abs_idx = np.argsort(np.abs(feature_contribs))[::-1][:10]
+
+        top_df = pd.DataFrame({
+            "feature_idx": top_abs_idx,
+            "contribution": feature_contribs[top_abs_idx],
+            "abs_contribution": np.abs(feature_contribs[top_abs_idx]),
+            "activation": pooled_vec[top_abs_idx],
+        }).sort_values("abs_contribution", ascending=True)
+
+        # 5. Отдельно топ AI и топ human признаки
+        pos_idx = np.where(feature_contribs > 0)[0]
+        neg_idx = np.where(feature_contribs < 0)[0]
+
+        top_ai_idx = pos_idx[np.argsort(feature_contribs[pos_idx])[::-1][:5]] if len(pos_idx) > 0 else np.array([], dtype=int)
+        top_human_idx = neg_idx[np.argsort(feature_contribs[neg_idx])[:3]] if len(neg_idx) > 0 else np.array([], dtype=int)
+
+        top_ai_features = []
+        for idx in top_ai_idx:
+            top_ai_features.append({
+                "feature_idx": int(idx),
+                "contribution": float(feature_contribs[idx]),
+                "activation": float(pooled_vec[idx]),
+            })
+
+        top_human_features = []
+        for idx in top_human_idx:
+            top_human_features.append({
+                "feature_idx": int(idx),
+                "contribution": float(feature_contribs[idx]),
+                "activation": float(pooled_vec[idx]),
+            })
+
+        # 6. График вкладов топ-10 признаков
+        plt.figure(figsize=(12, 5))
+        colors = ["#c0392b" if v > 0 else "#2980b9" for v in top_df["contribution"]]
+        plt.barh(
+            [f"SAE #{int(i)}" for i in top_df["feature_idx"]],
+            top_df["contribution"],
+            color=colors
+        )
+        plt.axvline(0, color="black", linewidth=1)
+        plt.title("Топ-10 SAE-признаков по вкладу в решение")
+        plt.xlabel("Вклад в решение XGBoost")
+        plt.ylabel("SAE-признак")
+        plt.tight_layout()
+
+        barplot_path = "static/sae_analysis_barplot.png"
+        plt.savefig(barplot_path, bbox_inches="tight")
+        plt.close()
+
+        # 7. График активации топ-1 признака по токенам
+        if len(top_abs_idx) > 0:
+            top_feature_idx = int(top_abs_idx[0])
+
+            token_latents = sae_latents[0, :, top_feature_idx].detach().float().cpu().numpy()
+            token_ids = batch["input_ids"][0].detach().cpu().tolist()
+            tokens = detector.tokenizer.convert_ids_to_tokens(token_ids)
+
+            # срежем паддинги
+            attn_mask = batch["attention_mask"][0].detach().cpu().numpy().astype(bool)
+            token_latents = token_latents[attn_mask]
+            tokens = [tok for tok, keep in zip(tokens, attn_mask) if keep]
+
+            # подписи токенов лучше прореживать, иначе график будет нечитаемым
+            x = np.arange(len(token_latents))
+
+            plt.figure(figsize=(13, 4.5))
+            plt.plot(x, token_latents, linewidth=1.8)
+            plt.title(f"Активация ключевого SAE-признака #{top_feature_idx} по токенам")
+            plt.xlabel("Позиция токена в тексте")
+            plt.ylabel("Активация признака")
+            plt.tight_layout()
+
+            activation_plot_path = "static/sae_top_feature_trace.png"
+            plt.savefig(activation_plot_path, bbox_inches="tight")
+            plt.close()
+
+            # Для текста под графиком удобно отдать немного токенов
+            token_preview = []
+            for i, (tok, val) in enumerate(zip(tokens[:80], token_latents[:80])):
+                token_preview.append({
+                    "pos": i,
+                    "token": tok,
+                    "activation": float(val),
+                })
+        else:
+            top_feature_idx = None
+            activation_plot_path = None
+            token_preview = []
+
+        # 8. Сводные показатели
+        total_pos = float(np.sum(feature_contribs[feature_contribs > 0])) if np.any(feature_contribs > 0) else 0.0
+        total_neg = float(np.sum(np.abs(feature_contribs[feature_contribs < 0]))) if np.any(feature_contribs < 0) else 0.0
+        total_abs = float(np.sum(np.abs(feature_contribs))) if np.sum(np.abs(feature_contribs)) > 0 else 1.0
+
+        ai_signal_pct = round(100.0 * total_pos / total_abs, 1)
+        human_signal_pct = round(100.0 * total_neg / total_abs, 1)
+        dominance_pct = round(100.0 * np.sum(np.abs(feature_contribs[top_abs_idx[:3]])) / total_abs, 1)
+
+        explanation = {
+            "prediction": prediction,
+            "ai_score": round(prob_ai, 4),
+            "bias_term": round(bias_term, 4),
+            "summary": {
+                "ai_signal_pct": ai_signal_pct,
+                "human_signal_pct": human_signal_pct,
+                "dominance_pct": dominance_pct,
+            },
+            "top_ai_features": top_ai_features,
+            "top_human_features": top_human_features,
+            "top_feature_idx": top_feature_idx,
+            "barplot_path": "/" + barplot_path,
+            "activation_plot_path": ("/" + activation_plot_path) if activation_plot_path else None,
+            "token_preview": token_preview,
+        }
+        return explanation
+
+    except Exception as e:
+        return {"error": f"Ошибка анализа SAE/Gemma: {str(e)}"}
 
 # Flask App Setup
 app = Flask(__name__)
@@ -765,6 +1093,7 @@ def extended_analysis_page():
             'extended_analysis_page.html',
             dep=None,
             diveye=None,
+            sae=None,
             error="Не удалось выполнить расширенный анализ: исходный текст не найден."
         )
 
@@ -776,6 +1105,7 @@ def extended_analysis_page():
             'extended_analysis_page.html',
             dep=None,
             diveye=None,
+            sae=None,
             error="Не удалось выполнить расширенный анализ: текст пуст."
         )
 
@@ -783,11 +1113,13 @@ def extended_analysis_page():
 
     dep = extended_analysis('temp_text.txt')
     diveye = extended_analysis_diveye(text, diveye_model, diveye_ai_prob)
+    sae = extended_analysis_sae_gemma(text, sae_xgb_model)
 
     return render_template(
         'extended_analysis_page.html',
         dep=dep,
         diveye=diveye,
+        sae=sae,
         error=None
     )
 

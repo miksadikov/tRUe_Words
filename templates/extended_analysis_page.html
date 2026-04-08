@@ -139,6 +139,107 @@
         </div>
         {% endif %}
 
+        {% if sae %}
+        <div class="analysis-block">
+          <h2>Расширенный анализ по методу SAE/Gemma</h2>
+
+          {% if sae.error %}
+            <p class="error">{{ sae.error }}</p>
+          {% else %}
+            <p>
+              <strong>
+                Текст классифицирован как
+                {% if sae.prediction == "ИИ-ГЕНЕРИРОВАННЫЙ" %}
+                  ИИ-сгенерированный
+                {% else %}
+                  написанный человеком
+                {% endif %}
+              </strong>
+              (Уверенность: {{ (sae.ai_score * 100) | round(1) }}%)
+            </p>
+
+            <p>
+              Метод SAE/Gemma анализирует скрытые признаки текста, извлечённые из внутреннего представления языковой модели Gemma.
+              Затем XGBoost оценивает, какие из этих признаков сильнее всего указывают на AI-генерацию или на человеческое авторство.
+            </p>
+
+            <div class="analysis-cards" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:16px; margin:20px 0;">
+              <div class="card" style="padding:16px;">
+                <h4 style="margin-top:0;">Суммарный сигнал AI-признаков</h4>
+                <p style="font-weight:700; color:#5b5cff; margin-bottom:8px;">
+                  {{ sae.summary.ai_signal_pct }}% вклада
+                </p>
+                <p style="margin:0;">
+                  Этот блок показывает, насколько сильно активные признаки SAE в совокупности подталкивали решение в сторону AI-генерации.
+                </p>
+              </div>
+
+              <div class="card" style="padding:16px;">
+                <h4 style="margin-top:0;">Суммарный сигнал human-признаков</h4>
+                <p style="font-weight:700; color:#5b5cff; margin-bottom:8px;">
+                  {{ sae.summary.human_signal_pct }}% вклада
+                </p>
+                <p style="margin:0;">
+                  Этот блок отражает, какая часть признаков поддерживала гипотезу о человеческом тексте.
+                </p>
+              </div>
+
+              <div class="card" style="padding:16px;">
+                <h4 style="margin-top:0;">Доминирование ключевых латентов</h4>
+                <p style="font-weight:700; color:#5b5cff; margin-bottom:8px;">
+                  {{ sae.summary.dominance_pct }}% вклада
+                </p>
+                <p style="margin:0;">
+                  Этот показатель показывает, насколько решение определяется небольшим числом наиболее сильных скрытых признаков.
+                </p>
+              </div>
+            </div>
+
+            {% if sae.barplot_path %}
+              <div class="analysis-image" style="margin:20px 0;">
+                <img src="{{ sae.barplot_path }}" alt="Топ-10 SAE-признаков по вкладу">
+              </div>
+            {% endif %}
+
+            {% if sae.activation_plot_path %}
+              <div class="analysis-image" style="margin:20px 0;">
+                <img src="{{ sae.activation_plot_path }}" alt="Активация ключевого SAE-признака">
+              </div>
+            {% endif %}
+
+            <div style="margin-top:24px;">
+              <h3>Какие признаки SAE/Gemma сильнее всего повлияли на решение</h3>
+
+              {% if sae.top_ai_features %}
+                <p><strong>Топ-5 AI-признаков:</strong></p>
+                <ul>
+                  {% for feat in sae.top_ai_features %}
+                    <li>
+                      <strong>SAE-признак #{{ feat.feature_idx }}</strong>
+                      — вклад {{ feat.contribution | round(4) }},
+                      активация {{ feat.activation | round(4) }}.
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% endif %}
+
+              {% if sae.top_human_features %}
+                <p><strong>Топ-3 human-признаков:</strong></p>
+                <ul>
+                  {% for feat in sae.top_human_features %}
+                    <li>
+                      <strong>SAE-признак #{{ feat.feature_idx }}</strong>
+                      — вклад {{ feat.contribution | round(4) }},
+                      активация {{ feat.activation | round(4) }}.
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% endif %}
+            </div>
+          {% endif %}
+        </div>
+        {% endif %}
+
         <div class="back-link">
             <a href="/">Вернуться на главную страницу</a>
         </div>
